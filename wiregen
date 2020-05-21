@@ -1,0 +1,455 @@
+#!/bin/bash
+
+#######################################################################
+## Script de geração e configuração servidor/cliente para Wireguard. ##
+## Escrito por Arthur Turrini <turrini@gmail.com>                    ##
+#######################################################################
+
+#######################################################################
+## Se não houver uma configuração pré existente do Wireguard, este   ##
+## script irá criar uma nova, atribuindo um par PublicKey/PrivateKey ##
+## aleatório, gerado pelo próprio Wireguard                          ##
+#######################################################################
+
+# Arquivo de configuração
+config="wiregen.ini"
+
+# Versão do wiregen
+version="2020-05-20"
+
+#######################################################################
+#######################################################################
+#######################################################################
+#######################################################################
+#######################################################################
+#######################################################################
+#######################################################################
+
+#####
+## Mensagens
+function msg() {
+    echo -e "$1"
+}
+function warn() {
+    msg "warning: $1"
+}
+function error() {
+    msg "error: $1"
+    exit
+}
+
+#####
+## Modo de uso
+function fn_print_usage() {
+    local error="$1"
+    if [[ -z "${error}" ]]; then
+        msg "wiregen - Wireguard Config Generator - versão ${version}"
+        msg "\nUso:\n\t$(basename $0) <comando> [opcoes]"
+        msg "\nComandos:"
+        msg "\t   add <nome utilizador>    - Adiciona um novo usuário à VPN *"
+        msg "\t   del <nome utilizador>    - Remove usuário da VPN *"
+        msg "\tconfig <nome utilizador>    - Mostra a configuração do usuário"
+        msg "\t  list [nome utilizador]    - Lista um ou todos os usuários cadastrados na VPN"
+        msg "\n  * Obs: os comandos 'add' e 'remove' quando utilizados efetuam o restart do Wireguard\n"
+    else
+        msg "erro: ${error}\n"
+    fi
+    exit
+}
+
+#####
+## Valida os argumentos da linha de comando
+function fn_parse_arguments() {
+    local command="$1"
+    local vpn_user="$2"
+    case "${command}" in
+        add)
+            fn_add_vpn_user "${vpn_config}" "${vpn_user}"
+        ;;
+
+        del|remove)
+            fn_del_vpn_user "${vpn_config}" "${vpn_user}"
+        ;;
+
+        config)
+            fn_config_vpn_user "${vpn_config}" "${vpn_user}"
+        ;;
+
+        list)
+            fn_list_vpn_users "${vpn_config}" "${vpn_user}"
+        ;;
+
+        *)
+            [[ ! -z "${command}" ]] && wrong_command="comando '${command}' não reconhecido."
+            fn_print_usage "${wrong_command}"
+            exit
+        ;;
+    esac
+}
+
+#####
+## Arquivo de configuração
+function fn_parse_wiregen_config() {
+    THIS="$( cd "`dirname "$0"`" ; pwd -P )"
+
+    # Localização do arquivo de configuração
+    if [[ "$(basename $config)" == "$config" ]]; then
+        if [[ -r "/etc/wireguard/wiregen.ini" ]]; then
+            config="/etc/wireguard/wiregen.ini"
+        elif [[ -r "${THIS}/wiregen.ini" ]]; then
+            config="${THIS}/wiregen.ini"
+        fi
+    fi
+
+    [[ ! -r "${config}" ]] && error "o arquivo base de configuração '$(basename ${config})' não foi encontrado."
+
+    # Importa arquivo de configuração
+    . "${config}"
+
+    # Validação dos parâmetros
+    [[ -z "${vpn_config}" ]]   && error "config: parâmetro 'vpn_config' precisa ser definido."
+    [[ -z "${vpn_endpoint}" ]] && error "config: parâmetro 'vpn_endpoint' precisa ser definido."
+    [[ -z "${vpn_subnet}" ]]   && error "config: parâmetro 'vpn_subnet' precisa ser definido."
+    [[ -z "${vpn_address}" ]]  && error "config: parâmetro 'vpn_address' precisa ser definido."
+    [[ -z "${vpn_name}" ]]     && warn  "config: parâmetro 'vpn_name' vazio, assumindo 'Servidor VPN'."
+    [[ -z "${vpn_export}" ]]   && warn  "config: parâmetro 'vpn_export' vazio, assumindo p2p."
+
+    # Nome do servidor para prefixo do arquivo do usuário
+    _vpn_name=$(fn_clean_string ${vpn_name})
+
+    # Protocolo da VPN
+    case "${vpn_protocol,,}" in
+        tcp)
+            _TCP="TCP"
+            _tcp="tcp://"
+        ;;
+
+        udp)
+        ;;
+
+        *)
+            warn "config: parâmetro 'vpn_protocol' vazio ou desconhecido, assumindo udp."
+    esac
+
+    # Nome da interface que será utilizada no Wireguard
+    vpn_interface=$(basename -- "${vpn_config}")
+    vpn_interface="${vpn_interface%.*}"
+
+    # Porta padrão caso não especificada
+    _vpn_port="51820"
+    unknown_port="config: porta não especificada em 'vpn_endpoint', assumindo ${_vpn_port}"
+    case "${vpn_endpoint}" in
+        (\[*\])
+            _vpn_address="${vpn_endpoint}"
+            warn "${unknown_port}"
+        ;;
+        (*:*)
+            _vpn_address="${vpn_endpoint%:*}"
+            _vpn_port="${vpn_endpoint##*:}"
+        ;;
+        (*)
+            _vpn_address="${vpn_endpoint}"
+            warn "${unknown_port}"
+        ;;
+    esac
+}
+
+#####
+## Gera uma chave privada
+function fn_generate_privatekey() {
+    wg genkey
+}
+
+#####
+## Gera uma chave pública
+function fn_generate_publickey() {
+    local privatekey="$1"
+    echo "${privatekey}" | wg genkey
+}
+
+#####
+## Normaliza uma string, remove todos os espaços e torna minúsculas
+function fn_clean_string() {
+    local string=$(echo $1 | tr -d '[:space:]')
+    echo ${string,,}
+}
+
+#####
+## Efetua o join de um array com separador, ex: fn_join_by , "${array[@]}"
+function fn_join_by() {
+    local IFS="$1"
+    shift
+    echo "$*"
+}
+
+#####
+## Cria arquivo do Wireguard caso não exista
+function fn_create_wg_config() {
+    local vpn_config="$1"
+    [[ -r "${vpn_config}" ]] && return
+
+    local server_privatekey=$(fn_generate_privatekey)
+    local server_publickey=$(fn_generate_publickey ${server_privatekey})
+
+    local server_post_up
+    [[ -z "${vpn_post_up}" ]]   && server_post_up="#PostUp ="     || server_post_up="PostUp = ${vpn_post_up}"
+    server_post_up=$(echo ${server_post_up} | sed -e "s/%/${vpn_interface}/g")
+
+    local server_post_down
+    [[ -z "${vpn_post_down}" ]] && server_post_down="#PostDown =" || server_post_down="PostDown = ${vpn_post_down}"
+    server_post_down=$(echo ${server_post_down} | sed -e "s/%/${vpn_interface}/g")
+
+    # Cria o arquivo de configuração do Wireguard
+cat <<-EOF | awk 'NR==1 && match($0, /^ +/){n=RLENGTH} {print substr($0, n+1)}' >"${vpn_config}"
+    ########################################
+    # ${vpn_name}
+    ########################################
+    [Interface]
+    # PublicKey = ${server_publickey}
+    PrivateKey = ${server_privatekey}
+
+    Address = ${_vpn_address}
+    ListenPort${_TCP} = ${_vpn_port}
+
+    ${server_post_up}
+    ${server_post_down}
+    ########################################
+EOF
+
+    msg "\nconfiguração criada: $(readlink -f ${vpn_config})\n"
+}
+
+#####
+## Faz dump da configuração do usuário
+function fn_show_user_config() {
+    local vpn_config="$1"
+    [[ ! -r "${vpn_config}" ]] && return
+
+    local vpn_user=$(fn_clean_string $2)
+
+read -d '' awk_filter_user <<EOF
+    /^# Cliente: ${vpn_user}$/ { if(h != 1) { h=1; next } }
+    /^# Cliente: |^########/  { h=0; next }
+    { if (h == 1) print; next }
+EOF
+    awk "${awk_filter_user}" "${vpn_config}"
+}
+
+#####
+## Verifica a existência de um usuário
+function fn_search_vpn_user() {
+    local vpn_config="$1"
+    local vpn_user="$2"
+
+    user_found=$(fn_show_user_config "${vpn_config}" "${vpn_user}" | grep -o ^PublicKey)
+    [[ ! -z "${user_found}" ]] && echo $vpn_user
+}
+
+#####
+## Retorna o próximo número final de ip disponível
+function fn_find_free_ip() {
+    local vpn_config="$1"
+
+    local ip_pool_begin=10
+    local ip_pool_end=250
+
+    local vpn_subnet_prefix="$(echo ${vpn_subnet} | cut -s -d. -f1-3)"
+
+    local used_ips=$(grep -E '^AllowedIPs ?= ?((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/32' \
+        "${vpn_config}" | awk -F" = " '{print $2}' | sort -n | cut -s -d. -f4 | cut -s -d/ -f1)
+    if [[ ! -z "${used_ips}" ]]; then
+        local first_unused=$(echo "${used_ips}" | awk 'p && p != $1 { for( i = p; i < $1; i++ ) print i; } {p = $1 + 1 }' | head -n1)
+        if [[ ! -z "${first_unused}" ]]; then
+            echo "${vpn_subnet_prefix}.${first_unused}/32"
+            return
+        else
+            local next_ip=$(( $(echo "${used_ips}" | tail -n1) + 1 ))
+            if (( ${next_ip} > ${ip_pool_end} )); then
+                error "não há mais ips disponíveis para uso nesta subnet."
+            fi
+            echo "${vpn_subnet_prefix}.${next_ip}/32"
+            return
+        fi
+    else
+        echo "${vpn_subnet_prefix}.${ip_pool_begin}/32"
+    fi
+}
+
+function fn_get_server_publickey() {
+    local vpn_config="$1"
+    [[ ! -r "${vpn_config}" ]] && return
+
+read -r -d '' awk_filter_publickey <<EOF
+    /^\[Interface\]/ { h=1; next }
+    /^# PublicKey = / { if(h) { printf("%s\n", \$4); exit } }
+    { next }
+EOF
+    awk "${awk_filter_publickey}" "${vpn_config}"
+}
+
+#####
+## Adiciona um novo usuário na VPN
+function fn_add_vpn_user() {
+    local vpn_config="$1"
+    [[ ! -r "${vpn_config}" ]] && return
+
+    local vpn_user="$(fn_clean_string $2)"
+    [[ -z "${vpn_user}" ]] && error "nome do utilizador não informado."
+
+    [[ "$(fn_search_vpn_user ${vpn_config} ${vpn_user})" == "${vpn_user}" ]] && error "utilizador já está cadastrado na VPN"
+
+    local client_address=$(fn_find_free_ip ${vpn_config})
+    local client_privatekey=$(fn_generate_privatekey)
+    local client_publickey=$(fn_generate_publickey ${client_privatekey})
+
+    local _vpn_export=$(fn_join_by , "${vpn_export[@]}")
+    local _vpn_dns=$(fn_join_by , "${vpn_dns[@]}")
+
+    local client_basefolder="$(dirname ${vpn_config})/clients"
+    mkdir -p "${client_basefolder}" &>/dev/null
+    local client_configfile="${client_basefolder}/vpn-${_vpn_name}-${vpn_user}.conf"
+
+    # Cria configuração do cliente
+    fn_config_vpn_user \
+        "${vpn_config}" "${vpn_user}" "${client_address}" \
+        "${client_publickey}" "${client_privatekey}" \
+        "${vpn_subnet}" "${_vpn_export}" "${_vpn_dns}" \
+        >"${client_configfile}"
+
+    # Insere novo usuário na configuração da VPN
+    echo >>"${vpn_config}"
+cat <<-EOF | awk 'NR==1 && match($0, /^ +/){n=RLENGTH} {print substr($0, n+1)}' >>"${vpn_config}"
+    ########################################
+    # Cliente: ${vpn_user}
+    [Peer]
+    PublicKey = ${client_publickey}
+    # PrivateKey = ${client_privatekey}
+    AllowedIPs = ${client_address}
+    ########################################
+EOF
+
+    msg "\nadd: '${vpn_user}' cadastrado com sucesso. Foi reservado o ip '${client_address}'."
+    msg "\nadd: arquivo do cliente: '${client_configfile}'"
+    msg "\nadd: reinicie o wireguard para que as configurações tenham efeito:\n\n\tsystemctl restart wg-quick@${vpn_interface}\n"
+}
+
+#####
+## Remove um usuário existente da VPN
+function fn_del_vpn_user() {
+    local vpn_config="$1"
+    [[ ! -r "${vpn_config}" ]] && return
+
+    local vpn_user="$(fn_clean_string $2)"
+    [[ -z "${vpn_user}" ]] && error "nome do utilizador não informado."
+
+    [[ "$(fn_search_vpn_user ${vpn_config} ${vpn_user})" != "${vpn_user}" ]] && error "utilizador não encontrado na VPN"
+
+read -r -d '' awk_remove_user <<EOF
+    /^########/ { if(!h) { hashline=\$0; hashfound=1; next } else { hashfound=0; h=0; next } }
+    /^# Cliente: ${vpn_user}$/ { h=1; next; }
+    { if(hashfound && !h) { hashfound=0; print hashline; hashline="" } if(!h) print }
+    END { if(hashfound) print hashline }
+EOF
+    awk "${awk_remove_user}" "${vpn_config}" | sed -e '/^$/N;/^\n$/D' >"${vpn_config}.$$"
+    mv -f "${vpn_config}.$$" "${vpn_config}"
+
+    msg "\ndel: '${vpn_user}' removido com sucesso."
+    msg "\ndel: reinicie o wireguard para que as configurações tenham efeito:\n\n\tsystemctl restart wg-quick@${vpn_interface}\n"
+}
+
+#####
+## Mostra a configuração do usuário
+function fn_config_vpn_user() {
+    local vpn_config="$1"
+    [[ ! -r "${vpn_config}" ]] && return
+
+    local vpn_user="$(fn_clean_string $2)"
+    [[ -z "${vpn_user}" ]] && error "nome do utilizador não informado."
+
+    local client_address="$3"
+    local client_publickey="$4"
+    local client_privatekey="$5"
+
+    if [[ -z "$3" ]]; then
+        [[ "$(fn_search_vpn_user ${vpn_config} ${vpn_user})" != "${vpn_user}" ]] && error "utilizador não encontrado na VPN"
+        read -r -d '' awk_filter_user <<EOF
+            /^# Cliente: ${vpn_user}/ { if(h != 1) { h=1; name=\$3; next } }
+            /^PublicKey = .*/ { if(h) publickey=\$3; next }
+            /^# PrivateKey = .*/ { if(h) privatekey=\$4; next }
+            /^AllowedIPs = .*/ { if(h) ip=\$3; next }
+            /^# Cliente:|^#######/ { if(h) printf("client_address=%s\nclient_publickey=%s\nclient_privatekey=%s\n", ip, publickey, privatekey)
+            h=0; next}
+            {next}
+EOF
+        eval "$(awk "${awk_filter_user}" "${vpn_config}")"
+        local _vpn_export=$(fn_join_by , "${vpn_export[@]}")
+        local _vpn_dns=$(fn_join_by , "${vpn_dns[@]}")
+        [[ ! -z "${vpn_export}" ]] && vpn_export=",${_vpn_export}"
+        [[ -z "${vpn_dns}" ]] && vpn_dns="# DNS = " || vpn_dns="DNS = ${_vpn_dns}"
+    else
+        local vpn_subnet="$6"
+        local vpn_export="$7"
+        local vpn_dns="$8"
+        [[ ! -z "${vpn_export}" ]] && vpn_export=",$7"
+        [[ -z "${vpn_dns}" ]] && vpn_dns="# DNS = " || vpn_dns="DNS = $8"
+    fi
+
+cat <<-EOF | awk 'NR==1 && match($0, /^ +/){n=RLENGTH} {print substr($0, n+1)}'
+    #########################################################
+    ### CONFIGURAÇÃO DO CLIENTE #############################
+
+    #########################################################
+    # Cliente: ${vpn_user}
+    #########################################################
+
+    [Interface]
+    # PublicKey = ${client_publickey}
+    PrivateKey = ${client_privatekey}
+    Address = ${client_address}
+    ${vpn_dns}
+
+    [Peer]
+    Endpoint = ${_tcp}${_vpn_address}:${_vpn_port}
+    PublicKey = $(fn_get_server_publickey ${vpn_config})
+    AllowedIPs = ${vpn_subnet}${vpn_export}
+    PersistentKeepalive = 25
+
+    #########################################################
+EOF
+}
+
+#####
+## Lista todos os usuários com seus ips e chaves públicas
+function fn_list_vpn_users() {
+    local vpn_config="$1"
+    [[ ! -r "${vpn_config}" ]] && return
+
+    local vpn_user=$(fn_clean_string $2)
+
+    read -r -d '' awk_filter_user <<EOF
+        /^# Cliente: ${vpn_user}/ { if(h != 1) { h=1; name=\$3; next } }
+        /^PublicKey = .*/ { if(h) publickey=\$3; next }
+        /^AllowedIPs = .*/ { if(h) ip=\$3; next }
+        /^# Cliente:|^#######/ { if(h) printf("client=%-12s ip=%-18s publicKey=%s\n", name, ip, publickey)
+            h=0; next}
+        {next}
+EOF
+    echo "# $(readlink -f ${vpn_config})"
+    awk "${awk_filter_user}" "${vpn_config}"
+}
+
+#####
+## main
+function main() {
+    # Parse da configuração do wiregen
+    fn_parse_wiregen_config
+
+    # Inicializa um arquivo do Wireguard caso não exista
+    fn_create_wg_config "${vpn_config}"
+
+    # Parse dos argumentos do programa
+    fn_parse_arguments $@
+}
+
+argv=( "$@" )
+main "${argv[@]}"
